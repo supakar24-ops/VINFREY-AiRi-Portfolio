@@ -1,0 +1,23 @@
+.env
+.env.*
+!.env.example
+.venv/
+.venv-*/
+venv/
+__pycache__/
+*.py[cod]
+
+# AiRi personal memory, including SQLite journal/WAL sidecars
+local_data/
+*.sqlite
+*.sqlite-*
+*.sqlite3
+*.sqlite3-*
+*.db
+*.db-*
+
+# Streamlit secrets are not used; keep accidental local configuration private.
+.streamlit/secrets.toml
+.tools/
+
+.claude/settings.local.json

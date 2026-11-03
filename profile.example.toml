@@ -1,0 +1,5 @@
+# AiRi local profile example.
+# Copy this file to local_data/profile.toml and change the value.
+# local_data/ is ignored by Git, so your real profile stays on this computer.
+# user_name: one line, at most 40 characters. Leave the file out to use no name.
+user_name = "Mali"
