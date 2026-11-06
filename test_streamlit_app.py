@@ -146,6 +146,9 @@ class UsageEntryPointTests(unittest.TestCase):
             " · ไม่มีข้อมูล usage 4 ครั้ง"])
         captions = [c.value for c in app.sidebar.caption]
         self.assertIn("เพดานนับจำนวน request ต่อ session นี้เท่านั้น ไม่ใช่เพดานค่าใช้จ่าย", captions)
+        # Both locations must include this run's requests, without waiting for another rerun.
+        self.assertEqual({c.value for c in app.caption if c.value.startswith(self.USAGE_CAPTION)},
+                         set(self.usage_caption(app)))
 
     def test_ui_limit_reached_message(self):
         app, factory = self.start(**{"usage.NORMAL_REQUEST_LIMIT": 0})
@@ -184,7 +187,8 @@ class LiveDemoUITests(unittest.TestCase):
     PRIVATE_NAME = "Zephyrine"
 
     def setUp(self):
-        environment = patch.dict(os.environ, {"VINFREY_DEMO": "1"})
+        environment = patch.dict(os.environ, {"VINFREY_DEMO": "1",
+                                              "OPENAI_API_KEY": "synthetic-placeholder"})
         environment.start()
         self.addCleanup(environment.stop)
         persona.DEFAULT_PROFILE_PATH.write_text(f'user_name = "{self.PRIVATE_NAME}"',
@@ -365,7 +369,7 @@ class WebUITests(unittest.TestCase):
         self.send("/remember Keep this note")
         self.client.responses.create.side_effect = [response("Hello")]
         self.send("Hello")
-        self.app.button[0].click().run()
+        self.app.button(key="new-conversation").click().run()
         self.assertEqual(self.app.session_state["messages"], [])
         self.assertEqual(self.assistant.history, [])
         self.assertEqual(len(self.store.list_memories()), 1)

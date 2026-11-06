@@ -1,6 +1,7 @@
 """Local chat UI. AiRi owns conversation logic; main.py owns the workflow."""
 
 import contextlib
+import json
 import os
 import shutil
 import sqlite3
@@ -15,6 +16,8 @@ from api import AgentError
 from memory import MemoryStore
 from persona import build_persona, load_profile
 from tools import default_tools
+from ui_components import (apply_styles, hero, overview, section_heading, system_state,
+                           welcome, workflow_overview)
 from usage import DEMO_REQUEST_LIMIT, NORMAL_REQUEST_LIMIT, UsageGuard, UsageLimitReached
 
 # Replies from these commands are shown with st.text: line breaks stay, and text that
@@ -27,6 +30,16 @@ DEMO_BANNER_TH = (f"LIVE API DEMO · ส่งข้อความไปยั�
                   "ตามปกติ อาจไม่ลบทันทีที่ปิดแท็บ) · ไม่ใช้ profile ส่วนตัว · "
                   f"เพดาน {DEMO_REQUEST_LIMIT} requests ต่อ session (ไม่ใช่เพดานค่าใช้จ่าย)")
 TRACE_LABEL = "รายละเอียดขั้นตอนของ Agents"
+CALCULATION_PROMPT = "ช่วยคำนวณ 12 * 7 ให้หน่อย"
+OFFLINE_DEMO_NOTICE = (
+    "ตอนนี้เป็น Demo Mode ที่ยังไม่ได้ตั้ง API key จึงยังคุยกับ AI, ใช้ /work หรือ /suggest ไม่ได้\n"
+    "ลองสาธิตคำนวณ 12 × 7 ด้วยเครื่องมือในเครื่อง หรือใช้คำสั่ง Memory ชั่วคราวได้ "
+    "หากต้องการใช้ AI ให้ตั้ง OPENAI_API_KEY ที่เครื่องซึ่งรันแอป แล้วส่งข้อความอีกครั้ง")
+OFFLINE_DEMO_BANNER_TH = (
+    "OFFLINE DEMO · ยังไม่ได้ตั้ง API key จึงไม่ส่งคำขอ AI · "
+    "สาธิตคำนวณในเครื่องและใช้ Memory ชั่วคราวได้ · "
+    "ไม่ใช้ Memory หรือ profile ส่วนตัว · Memory ชั่วคราวลบเมื่อระบบเก็บกวาด session "
+    "หรือปิด server ตามปกติ อาจไม่ลบทันทีที่ปิดแท็บ")
 
 
 def status_line(event):
@@ -72,6 +85,9 @@ def model_code(body):
 def render_message(message):
     """Render stored messages identically on submission and later reruns."""
     with st.chat_message(message["role"], avatar="🌿" if message["role"] == "assistant" else None):
+        st.caption("Local demo · calculate" if message.get("local_tool") else
+                   "Demo mode" if message.get("demo_notice") else
+                   "AiRi" if message["role"] == "assistant" else "คุณ")
         if message.get("error"):
             st.error(message["content"])
         elif "work" in message:
@@ -88,7 +104,7 @@ def render_message(message):
             if message.get("trace"):
                 render_trace(message["trace"])
         elif message.get("plain"):
-            st.text(message["content"])
+            st.text(message["content"], wrap=True)
         elif message["role"] == "assistant":
             # AiRi's chat reply is model text: plain text, never Markdown or HTML.
             st.text(message["content"], wrap=True)
@@ -115,9 +131,37 @@ def run_work(assistant, task):
     return {"role": "assistant", "work": outcome, "trace": trace}
 
 
+def demo_without_key():
+    """Use the actual isolated session, not the edition label or a changed environment flag."""
+    return "demo_cleanup" in st.session_state and not os.getenv("OPENAI_API_KEY", "").strip()
+
+
+def offline_demo_reply(assistant, message):
+    """One explicit existing tool example; no intent inference or fabricated AI replies."""
+    if message.strip() in (CALCULATION_PROMPT, "ลองคำนวณ 12 × 7"):
+        names = assistant.tools.names() if assistant.tools is not None else ()
+        if "calculate" in names:
+            result = json.loads(assistant.tools.run("calculate", json.dumps({"expression": "12 * 7"})))
+            value = result.get("result", {}).get("value")
+            if result.get("ok") and isinstance(value, str):
+                return {"role": "assistant", "plain": True, "local_tool": True,
+                        "content": f"12 × 7 = {value}\n"
+                                   "ผลจากเครื่องมือ calculate ที่คำนวณจริงในเครื่อง · ไม่ได้เรียก AI หรือ API"}
+        return {"role": "assistant", "plain": True, "demo_notice": True,
+                "content": "session นี้ยังสาธิตเครื่องมือ calculate ไม่ได้ · ไม่ได้เรียก AI หรือ API\n"
+                           + OFFLINE_DEMO_NOTICE}
+    return {"role": "assistant", "plain": True, "demo_notice": True,
+            "content": OFFLINE_DEMO_NOTICE}
+
+
 def respond(assistant, message):
     """Use AiRi's shared entry points; never create another API or agent loop."""
     command, _, task = message.strip().partition(" ")
+    # Both chat input and queued starter callbacks pass here. Check again at dispatch
+    # time so a removed key cannot fall through to a previously cached API client.
+    if demo_without_key() and (not message.strip().startswith("/")
+                               or command == "/work" or message.strip() == "/suggest"):
+        return offline_demo_reply(assistant, message)
     if command == "/work":
         return run_work(assistant, task.strip())
     reply = {"role": "assistant", "content": assistant.handle(message)}
@@ -167,12 +211,16 @@ def usage_caption(snapshot):
     return text
 
 
-def render_usage(assistant):
+def render_usage(assistant, workspace=None):
     """Drawn last, after this run's request, so the numbers are current."""
     if assistant.usage is None:
         return
-    st.sidebar.caption(usage_caption(assistant.usage.snapshot()))
+    caption = usage_caption(assistant.usage.snapshot())
+    st.sidebar.caption(caption)
     st.sidebar.caption("เพดานนับจำนวน request ต่อ session นี้เท่านั้น ไม่ใช่เพดานค่าใช้จ่าย")
+    if workspace is not None:
+        with workspace.container():
+            st.caption(caption)
 
 
 def start_demo_session():
@@ -210,14 +258,15 @@ def render_pending(assistant):
                     on_click=decide, args=("/deny", action.id))
 
 
-def main():
-    st.set_page_config(page_title="AiRi | VINFREY", page_icon="🌿", layout="centered")
-    st.title("AiRi 🌿")
-    st.caption("VINFREY · AI conversation & reviewed work · Local portfolio demo")
-
+def render_sidebar():
+    """Keep the existing privacy disclosures and session reset within easy reach."""
     with st.sidebar:
-        st.subheader("คุยกับ AiRi")
-        st.write("คุยกันได้ตามปกติ หรือส่งงานให้ workflow ช่วยวางแผนและตรวจผลงาน")
+        st.subheader("AiRi / Session")
+        if st.button("เริ่มบทสนทนาใหม่", key="new-conversation", width="stretch",
+                     help="ล้างแชตและรายการรออนุมัติ โดยยังเก็บ Memory และตัวนับ API ไว้"):
+            st.session_state.messages = []
+            st.session_state.pop("ui_command", None)
+            st.session_state.airi.new_conversation()
         st.markdown(
             "**คำสั่ง**\n\n"
             "- `/remember <ข้อความ>` บันทึกสิ่งที่อยากให้จำ\n"
@@ -227,7 +276,7 @@ def main():
         )
         st.caption("Planner → Researcher → Builder → Reviewer พร้อม feedback/retry")
         st.divider()
-        if demo_mode():
+        if "demo_cleanup" in st.session_state:
             st.caption("โหมดสาธิต: Memory เป็นไฟล์ชั่วคราวเฉพาะ session นี้ แยกจากแท็บอื่น "
                        "ไม่ใช้ฐานข้อมูล Memory ส่วนตัว · ลบเมื่อระบบเก็บกวาด session นี้หรือเมื่อปิด "
                        "server ตามปกติ อาจไม่ลบทันทีที่ปิดแท็บ")
@@ -241,6 +290,79 @@ def main():
             st.caption("API: ตั้งค่า environment แล้ว (ยังไม่ได้ตรวจสิทธิ์หรือ quota)")
         else:
             st.info("ยังไม่ได้ตั้ง OPENAI_API_KEY · ใช้คำสั่ง Memory ได้ ส่วนแชตและ /work ต้องใช้ key")
+        if "demo_cleanup" in st.session_state:
+            if demo_without_key():
+                st.info(OFFLINE_DEMO_BANNER_TH)
+            else:
+                st.warning(DEMO_BANNER_TH)
+        if st.session_state.get("profile_warning"):
+            st.warning(PROFILE_WARNING_TH)
+
+
+def queue_command(command):
+    """An explicit button click follows the same command path as typing in chat."""
+    st.session_state.ui_command = command
+
+
+def render_controls(assistant, *, api_configured):
+    section_heading("01", "Your workspace", "เครื่องมือเล็ก ๆ สำหรับสิ่งที่คุณอยากทำ")
+    left, right = st.columns(2, gap="small")
+    left.button("ดู Memory", key="show-memories", on_click=queue_command,
+                args=("/memories",), width="stretch")
+    right.button("คำสั่งทั้งหมด", key="show-help", on_click=queue_command,
+                 args=("/help",), width="stretch")
+    left.button("รายการรออนุมัติ", key="show-pending", on_click=queue_command,
+                args=("/pending",), width="stretch")
+    right.button("การใช้ API", key="show-usage", on_click=queue_command,
+                 args=("/usage",), width="stretch")
+    with st.expander("Memory · สิ่งที่คุณเลือกให้จำ"):
+        st.caption("บันทึกเมื่อคุณสั่งเท่านั้น · การลบและสิ่งที่ AI เสนอต้องผ่านการอนุมัติ")
+        with st.form("remember-note", clear_on_submit=True):
+            note = st.text_area("อยากให้ AiRi จำอะไร", max_chars=2000, key="memory-note",
+                                placeholder="เช่น ชอบเรียน Python จากตัวอย่างสั้น ๆ")
+            if st.form_submit_button("บันทึก Memory", width="stretch"):
+                queue_command(f"/remember {note}")
+        st.button("ให้ AiRi เสนอ Memory", key="suggest-memory", on_click=queue_command,
+                  args=("/suggest",), disabled=not assistant.history or not api_configured,
+                  help="ใช้ข้อความแชตล่าสุดและเรียก API · ทุกข้อเสนอรออนุมัติก่อนบันทึก",
+                  width="stretch")
+        st.caption("ลบรายการด้วย /forget <id> ในแชต แล้วตรวจการ์ดอนุมัติก่อนตัดสินใจ")
+    st.divider()
+    section_heading("02", "A thoughtful workflow", "ภาพรวม 4 บทบาท · เริ่มด้วย /work")
+    workflow_overview()
+    st.caption("Planner → Researcher → Builder → Reviewer · ใช้ /work <งาน> เพื่อเริ่ม "
+               "แก้ได้สูงสุด 3 รอบ · PASS เป็นการตรวจของ AI")
+    with st.expander("Tools · คำนวณในเครื่อง"):
+        names = assistant.tools.names() if assistant.tools is not None else ()
+        if not names:
+            st.caption("session นี้ไม่ได้เปิด Tool Calling")
+        for name in names:
+            st.text({"calculate": "calculate · เลขคณิต", "date_math": "date_math · คำนวณวันที่"}.get(name, name))
+        st.caption("Demo ไม่มี key: ปุ่มคำนวณสาธิตเรียก calculate ในเครื่อง · ไม่ได้ใช้ AI"
+                   if demo_without_key() else
+                   "AiRi เลือกเรียกระหว่างแชต · ไม่อ่านไฟล์ ไม่ต่อเครือข่าย และไม่แก้ Memory")
+    with st.expander("Session & privacy"):
+        usage_view = st.empty()
+        st.caption("ไม่บันทึกแชตลงไฟล์ · ข้อมูลที่เกี่ยวข้องถูกส่งไป OpenAI เมื่อใช้ AI")
+        st.caption("ดูรายละเอียดโหมด ข้อมูลที่ส่ง และเริ่มบทสนทนาใหม่ได้ในแถบด้านข้าง")
+    return usage_view
+
+
+def dashboard_snapshot(assistant):
+    """Read safe metadata via existing interfaces; never render saved note content here."""
+    try:
+        memory_count = len(assistant.memory.list_memories())
+    except (sqlite3.Error, OSError):
+        memory_count = None
+    return {"memory_count": memory_count, "pending_count": len(assistant.gate.pending()),
+            "tool_names": assistant.tools.names() if assistant.tools is not None else (),
+            "usage": assistant.usage.snapshot() if assistant.usage is not None else None}
+
+
+def main():
+    st.set_page_config(page_title="AiRi | VINFREY", page_icon="🌿", layout="wide",
+                       initial_sidebar_state="collapsed")
+    apply_styles()
 
     if "airi" not in st.session_state:
         if demo_mode():
@@ -253,39 +375,77 @@ def main():
                     MemoryStore(), persona=build_persona(profile.get("user_name")),
                     tools=default_tools(), usage=UsageGuard(NORMAL_REQUEST_LIMIT))
             except (sqlite3.Error, OSError):
+                hero(("Error", "เปิด Memory ไม่สำเร็จ", "error"))
                 st.error("เปิด Memory ไม่ได้ กรุณาตรวจสิทธิ์เขียนโฟลเดอร์ local_data แล้วลองโหลดหน้าใหม่")
                 st.stop()
-    if "demo_cleanup" in st.session_state:
-        st.sidebar.warning(DEMO_BANNER_TH)
-    if st.session_state.get("profile_warning"):
-        st.sidebar.warning(PROFILE_WARNING_TH)
     if "messages" not in st.session_state:
         st.session_state.messages = []
+    assistant = st.session_state.airi
+    render_sidebar()
+    api_configured = bool(os.getenv("OPENAI_API_KEY", "").strip())
+    hero_slot, overview_slot = st.empty(), st.empty()
 
-    if st.sidebar.button("เริ่มบทสนทนาใหม่", help="ล้างแชตใน session นี้ โดยยังเก็บ Memory ไว้"):
-        st.session_state.messages = []
-        st.session_state.airi.new_conversation()
+    def refresh_dashboard(*, busy=False):
+        snapshot = dashboard_snapshot(assistant)
+        state = system_state(api_configured=api_configured,
+                             memory_available=snapshot["memory_count"] is not None,
+                             messages=st.session_state.messages, usage=snapshot["usage"], busy=busy,
+                             offline_demo=demo_without_key())
+        with hero_slot.container():
+            hero(state, live_demo="demo_cleanup" in st.session_state and api_configured,
+                 offline_demo=demo_without_key())
+        with overview_slot.container():
+            overview(**snapshot)
 
-    if not st.session_state.messages:
-        st.info("วันนี้อยากคุยเรื่องอะไร หรือมีงานให้ช่วยคิดก็ส่งมาได้")
-    for message in st.session_state.messages:
-        render_message(message)
-
-    prompt = st.chat_input("พิมพ์ข้อความ หรือ /work ตามด้วยงานที่อยากทำ")
-    if prompt and prompt.strip():
-        user_message = {"role": "user", "content": prompt}
-        st.session_state.messages.append(user_message)
-        render_message(user_message)
-        # /work shows its own st.status progress; chat keeps the simple spinner.
-        is_work = prompt.strip().partition(" ")[0] == "/work"
-        with contextlib.nullcontext() if is_work else st.spinner("AiRi กำลังตอบ…"):
-            reply = answer(st.session_state.airi, prompt)
-        st.session_state.messages.append(reply)
-        render_message(reply)
-
-    # After handling input so a new /forget request shows its card on the same run.
-    render_pending(st.session_state.airi)
-    render_usage(st.session_state.airi)
+    refresh_dashboard()
+    with st.container(key="workspace"):
+        controls, conversation = st.columns([.32, .68], gap="large")
+        with controls, st.container(key="controls"):
+            usage_view = render_controls(assistant, api_configured=api_configured)
+        with conversation, st.container(key="conversation"):
+            section_heading("03", "A conversation with AiRi", "พื้นที่ของคุณ · คุยต่อได้ใน session เดิม")
+            history = st.container(height=380, border=False, key="conversation-history")
+            with history:
+                if not st.session_state.messages:
+                    welcome()
+                    with st.container(key="starters"):
+                        offline = demo_without_key()
+                        local_calculate = assistant.tools is not None and "calculate" in assistant.tools.names()
+                        st.caption("Demo ไม่มี key · ปุ่มคำนวณใช้เครื่องมือในเครื่อง ส่วนคำถาม AI จะแจ้งข้อจำกัด"
+                                   if offline else "ลองเริ่มจากเรื่องใกล้ตัว · ปุ่มคำถามใช้ API")
+                        a, b = st.columns(2)
+                        a.button("ช่วยวางแผนการเรียน", key="starter-plan", on_click=queue_command,
+                                 args=("ช่วยวางแผนการเรียนสำหรับสัปดาห์นี้",),
+                                 disabled=not api_configured and not offline, width="stretch")
+                        b.button("ลองคำนวณ 12 × 7", key="starter-calculate", on_click=queue_command,
+                                 args=(CALCULATION_PROMPT,),
+                                 disabled=not api_configured and not (offline and local_calculate),
+                                 help="Demo ไม่มี key: คำนวณจริงในเครื่อง · โหมดอื่นใช้ AI ตามปกติ",
+                                 width="stretch")
+                for message in st.session_state.messages:
+                    render_message(message)
+            prompt = st.chat_input("เล่าให้ฟัง หรือพิมพ์ /work ตามด้วยงานที่อยากทำ",
+                                   key="conversation-input")
+            queued = st.session_state.pop("ui_command", None)
+            message = prompt or queued
+            if message and message.strip():
+                user_message = {"role": "user", "content": message}
+                st.session_state.messages.append(user_message)
+                refresh_dashboard(busy=True)
+                with history:
+                    render_message(user_message)
+                    is_work = message.strip().partition(" ")[0] == "/work"
+                    with contextlib.nullcontext() if is_work else st.spinner(
+                            "กำลังตรวจคำขอสาธิต…" if demo_without_key() else "AiRi กำลังตอบ…"):
+                        reply = answer(assistant, message)
+                    st.session_state.messages.append(reply)
+                    render_message(reply)
+                refresh_dashboard()
+            with st.container(key="conversation-footer"):
+                st.caption("คุณเป็นคนตัดสินใจ · Memory ไม่บันทึกอัตโนมัติ · ตรวจงานสำคัญด้วยตัวเองเสมอ")
+            with st.container(key="pending"):
+                render_pending(assistant)
+    render_usage(assistant, usage_view)
 
 
 if __name__ == "__main__":

@@ -186,7 +186,8 @@ class UiDemoRehearsalTests(DemoRehearsalChecks, unittest.TestCase):
     def setUp(self):
         self.stores = Mock(wraps=MemoryStore)
         self.client = demo_client()
-        for item in (patch.dict(os.environ, {"VINFREY_DEMO": "1"}),
+        for item in (patch.dict(os.environ, {"VINFREY_DEMO": "1",
+                                           "OPENAI_API_KEY": "synthetic-placeholder"}),
                      patch("api.create_client", return_value=self.client),
                      patch("airi._local_now", return_value=NOW),
                      patch("persona.load_profile",
